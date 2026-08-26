@@ -1,0 +1,9 @@
+.vscode/**
+src/**
+scripts/**
+.gitignore
+tsconfig.json
+**/*.map
+.env.example
+Installation_Guide.md
+Installation_Guide.pdf

@@ -1,0 +1,66 @@
+{
+  "name": "retroper",
+  "displayName": "Retroper",
+  "description": "AI usage observability & DLP for IDE AI tools (in-editor chat + coding agents)",
+  "version": "1.0.10",
+  "publisher": "retroper",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "retroper.flushQueue",
+        "title": "Retroper: Flush Queued Records Now"
+      },
+      {
+        "command": "retroper.showStatus",
+        "title": "Retroper: Show Capture Status"
+      },
+      {
+        "command": "retroper.sendTestRecord",
+        "title": "Retroper: Send Test Record"
+      },
+      {
+        "command": "retroper.login",
+        "title": "Retroper: Login"
+      },
+      {
+        "command": "retroper.logout",
+        "title": "Retroper: Logout"
+      },
+      {
+        "command": "retroper.openAuditLog",
+        "title": "Retroper: Open Audit Log"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --allow-package-env-file",
+    "release": "node scripts/release.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/sql.js": "^1.4.11",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "sql.js": "^1.14.2"
+  },
+  "allowScripts": {
+    "@vscode/vsce-sign@2.1.0": true,
+    "keytar@7.9.0": true
+  }
+}
