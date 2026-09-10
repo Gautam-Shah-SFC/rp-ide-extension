@@ -22,4 +22,10 @@ export interface CaptureEvent {
   path: string;
   pageTitle: string;
   toolActivity: ToolActivitySummary;
+  /** How much of the model's context window this conversation had used, if the provider exposes
+   * it (Cursor does, per-composer). Not a token-limit/truncation signal on its own - just useful
+   * supporting context for a turn that never got a normal completion signal and had to be given
+   * up on (see settleReason for that case). */
+  contextTokensUsed?: number;
+  contextTokenLimit?: number;
 }

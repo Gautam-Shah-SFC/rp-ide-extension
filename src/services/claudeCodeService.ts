@@ -24,16 +24,23 @@ interface TranscriptEntry {
   uuid?: string;
   timestamp?: string;
   sessionId?: string;
+  entrypoint?: string;
   message?: {
     role?: string;
     content?: ContentBlock[];
     stop_reason?: string;
   };
+  attachment?: {
+    type?: string;
+    prompt?: ContentBlock[];
+  };
 }
 
 /**
- * Claude Code (CLI or the editor tab - same underlying transcript either way) writes each
- * conversation as an append-only JSONL file at ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl,
+ * Claude Code (CLI or the editor's Claude Code integration - same underlying transcript format
+ * either way, distinguished per-entry by `entrypoint`: "claude-vscode" vs "cli" - see the check in
+ * processTranscriptFile) writes each conversation as an append-only JSONL file at
+ * ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl,
  * one full JSON object per line - unlike Cursor/VS Code Chat's mutating state files, each line here
  * is written once its message is complete, so there's no partial/streaming-text case to guard
  * against. A "turn" is one real user text message followed by a chain of assistant messages
@@ -170,6 +177,15 @@ export class ClaudeCodeProvider implements Provider {
         const parsed = JSON.parse(line);
         if ((parsed.type === "user" || parsed.type === "assistant") && Array.isArray(parsed.message?.content)) {
           entries.push(parsed);
+        } else if (parsed.type === "attachment" && parsed.attachment?.type === "queued_command" && Array.isArray(parsed.attachment?.prompt)) {
+          // CONFIRMED via real data on 2026-09-09 (this exact session, mid-turn message "yeah but
+          // that tag won't be shared..."): a message sent while a turn is still running is NOT
+          // stored as a type:"user" entry - it's a distinct { type:"attachment", attachment:
+          // {type:"queued_command", prompt:[...]} } shape that lands mid-chain, addressed by the
+          // SAME ongoing response as the turn it interrupted. Kept as its own entry kind (not
+          // pushed as if it were a real anchor) so it can be folded into the enclosing turn's
+          // prompt text below, instead of silently vanishing.
+          entries.push(parsed);
         }
       } catch {
         continue;
@@ -185,7 +201,6 @@ export class ClaudeCodeProvider implements Provider {
         continue;
       }
 
-      const prompt = textOf(anchor.message?.content ?? []);
       const sessionId = anchor.sessionId ?? path.basename(filePath, ".jsonl");
       const turnKey = `${sessionId}:${anchor.uuid ?? turnIndex}`;
 
@@ -197,7 +212,26 @@ export class ClaudeCodeProvider implements Provider {
         j++;
       }
 
+      const queuedMidTurnTexts = chain
+        .filter((e) => e.type === "attachment" && e.attachment?.type === "queued_command")
+        .map((e) => textOf(e.attachment?.prompt ?? []))
+        .filter(Boolean);
+      const prompt = [textOf(anchor.message?.content ?? []), ...queuedMidTurnTexts].filter(Boolean).join("\n\n");
+
       if (this.emittedTurnKeys.has(turnKey)) {
+        turnIndex++;
+        i = j;
+        continue;
+      }
+
+      // CONFIRMED via real data on 2026-09-09 (session f531d3b0, project FL-Nova): Claude Code
+      // stamps every entry with `entrypoint` - "claude-vscode" when run through the IDE's Claude
+      // Code integration, "cli" when run from a standalone terminal - and a single session can
+      // genuinely switch between the two mid-conversation (this real session did, on 2026-09-08).
+      // Retroper is scoped to IDE activity only: a "cli" anchor is marked seen (so it's never
+      // rechecked) but never captured/uploaded.
+      if (anchor.entrypoint === "cli") {
+        this.emittedTurnKeys.add(turnKey);
         turnIndex++;
         i = j;
         continue;

@@ -24,6 +24,8 @@ export interface CaptureDetails {
   files_edited_count?: number;
   permission_prompts_count?: number;
   tool_calls_count?: number;
+  context_tokens_used?: number;
+  context_token_limit?: number;
 }
 
 /** Matches backend schema retroper.ai_interaction.v0.2 */

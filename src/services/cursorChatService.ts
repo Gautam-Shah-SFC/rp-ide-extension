@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as vscode from "vscode";
 import initSqlJs, { Database as SqlJsDatabase, SqlJsStatic } from "sql.js";
 import { Provider, CaptureEventHandler } from "../class/Provider";
 import { ToolActivitySummary } from "../class/CaptureEvent";
@@ -10,11 +11,16 @@ import { SettleTracker } from "./settleTracker";
 import { tryAcquireLock, releaseLock } from "../utils/fileLock";
 
 const POLL_INTERVAL_MS = 20_000;
+// Generous on purpose - the longest real agent turn seen so far ran ~3.5 minutes, so this leaves
+// wide headroom before ever giving up on something still genuinely working.
+const MAX_WAIT_MS = 20 * 60_000;
 
 interface ConversationHeader {
   bubbleId: string;
   type: number;
-  grouping?: { isRenderable?: boolean; hasText?: boolean };
+  // turnDurationMs is CONFIRMED present only on a turn's genuinely final bubble (the one Cursor
+  // itself considers the end of that reply) - see the ready-check below for why this matters.
+  grouping?: { isRenderable?: boolean; hasText?: boolean; turnDurationMs?: number };
   createdAt: string;
 }
 
@@ -22,6 +28,21 @@ interface ComposerData {
   composerId: string;
   status?: string;
   fullConversationHeadersOnly?: ConversationHeader[];
+  // CONFIRMED via real data on 2026-09-01: Cursor's agent mode can spawn a genuinely separate
+  // composer record (its own composerData:<id> entry, own bubbles, own status) to run a
+  // sub-agent tool call (e.g. the "explore" subagent behind a task_v2 tool invocation) - its
+  // "user" bubble is text the AI itself generated as the sub-agent's instructions, not anything
+  // the human typed. subagentInfo.parentComposerId is present only on these - real, top-level,
+  // user-initiated composers never have it. Without this check, a sub-agent's internal task gets
+  // captured and uploaded as if it were a real user prompt (verified: a real "explore repo
+  // architecture" sub-agent task got captured this way, attributed as if the user had typed it).
+  subagentInfo?: { parentComposerId?: string };
+  // Real, populated fields (verified 2026-09-01: 56057/200000 on an actual long conversation) -
+  // how much of the model's context window this composer has used so far. Not a per-turn
+  // output-length/truncation signal (no such marker was found anywhere in real bubble or composer
+  // data), just useful supporting context attached to a turn that had to be given up on below.
+  contextTokensUsed?: number;
+  contextTokenLimit?: number;
 }
 
 interface Bubble {
@@ -127,6 +148,18 @@ class CursorDb {
   }
 }
 
+/** True only when this extension instance is actually running inside Cursor itself, not some
+ * other VS Code-based IDE that merely happens to have Cursor also installed on the same machine.
+ * CONFIRMED necessary via real evidence on 2026-09-01: state.vscdb lives at a fixed, well-known
+ * path independent of which app is hosting the extension, so without this check a VS Code-hosted
+ * Retroper install would also happily scan Cursor's chat data - and since each host keeps its own
+ * separate dedup-state file (globalStorageUri differs per app), the SAME Cursor turn would get
+ * captured and uploaded once by each host, with the cross-process file lock providing no
+ * protection at all (it's also scoped per-host, not actually shared between them). */
+function isRunningInsideCursor(): boolean {
+  return vscode.env.appName.toLowerCase().includes("cursor");
+}
+
 /**
  * Cursor persists chat/agent sessions ("composers") in its global state.vscdb:
  * - cursorDiskKV["composerData:<composerId>"] -> session metadata + ordered message headers
@@ -144,6 +177,12 @@ export class CursorChatProvider implements Provider {
   private emittedTurnKeys: Set<string> = new Set();
   private settleTracker = new SettleTracker();
   private lockPath: string;
+  // First-seen time per not-yet-captured turnKey, so a turn that never gets a genuine completion
+  // signal (no turnDurationMs marker ever appears - e.g. a genuinely stuck/crashed agent run) can
+  // eventually be given up on instead of held forever and silently lost. In-memory only - losing
+  // this on an extension restart just resets the wait, which is harmless (worst case: waits the
+  // full period again). See the ready-check below for where this is used.
+  private pendingSince = new Map<string, number>();
 
   constructor(private readonly statePath: string) {
     this.dbPath = path.join(ideUserDataDir("Cursor"), "globalStorage", "state.vscdb");
@@ -151,6 +190,7 @@ export class CursorChatProvider implements Provider {
   }
 
   async isAvailable(): Promise<boolean> {
+    if (!isRunningInsideCursor()) return false;
     return fs.existsSync(this.dbPath);
   }
 
@@ -259,55 +299,127 @@ export class CursorChatProvider implements Provider {
     } catch {
       return;
     }
+    // A sub-agent's own internal composer, not a real user-initiated conversation - see the
+    // ComposerData.subagentInfo doc comment above for what this is and why it's skipped entirely.
+    if (composer.subagentInfo?.parentComposerId) return;
     const hasBlockingPendingAction = pendingActionMap.get(composer.composerId) === true;
     const headers = composer.fullConversationHeadersOnly ?? [];
 
     let turnIndex = 0;
-    for (let i = 0; i < headers.length; i++) {
+    let i = 0;
+    while (i < headers.length) {
       const userHeader = headers[i];
-      if (userHeader.type !== 1) continue;
-      const assistantHeader = headers[i + 1]?.type === 2 ? headers[i + 1] : undefined;
-
-      const turnKey = `${composer.composerId}:${userHeader.bubbleId}`;
-      if (this.emittedTurnKeys.has(turnKey)) continue;
-
-      const userBubble = this.readBubble(db, composer.composerId, userHeader.bubbleId);
-      const assistantBubble = assistantHeader
-        ? this.readBubble(db, composer.composerId, assistantHeader.bubbleId)
-        : undefined;
-
-      const prompt = userBubble?.text ?? "";
-      const response = assistantBubble?.text ?? "";
-      const hasResponse = response.length > 0;
-
-      if (!prompt) {
-        turnIndex++;
+      if (userHeader.type !== 1) {
+        i++;
         continue;
       }
 
-      // Only emit once the assistant has actually produced a final answer (stable across
-      // consecutive polls - streaming text seen once could still be mid-generation) or the
-      // composer settled with no response ever coming (e.g. aborted before replying). A
-      // pending permission/approval prompt takes priority over both - "stable" text there
-      // just means it's paused, not finished, so never treat it as ready.
-      const isSettled = composer.status !== undefined && composer.status !== "in_progress";
+      // Collect the FULL assistant run following this user message - everything up to (not
+      // including) the next user header. CONFIRMED via a real agent-mode conversation on
+      // 2026-09-01 that a single reply commonly spans several bubbles (a "thinking" bubble with
+      // no text, one or more tool-call bubbles with no text, short narration bubbles, and the
+      // actual final answer several bubbles later) - previously only headers[i+1] was read as
+      // "the" response, which for this real conversation was an empty thinking bubble, so the
+      // turn got captured with prompt present and response permanently empty. Concatenating every
+      // non-empty text bubble in the run (same pattern already used for Claude Code/Codex/VS Code
+      // Chat's multi-block responses) captures the real final answer along with any narration.
+      let j = i + 1;
+      const assistantHeaders: ConversationHeader[] = [];
+      while (j < headers.length && headers[j].type !== 1) {
+        assistantHeaders.push(headers[j]);
+        j++;
+      }
+
+      const turnKey = `${composer.composerId}:${userHeader.bubbleId}`;
+      if (this.emittedTurnKeys.has(turnKey)) {
+        turnIndex++;
+        i = j;
+        continue;
+      }
+
+      const userBubble = this.readBubble(db, composer.composerId, userHeader.bubbleId);
+      const assistantBubbles = assistantHeaders.map((h) => this.readBubble(db, composer.composerId, h.bubbleId));
+      const response = assistantBubbles
+        .map((b) => b?.text)
+        .filter((t): t is string => !!t)
+        .join("\n\n");
+      const hasResponse = response.length > 0;
+
+      const prompt = userBubble?.text ?? "";
+      if (!prompt) {
+        turnIndex++;
+        i = j;
+        continue;
+      }
+
+      // Only ever consider a turn ready once Cursor itself has marked THIS SPECIFIC reply as
+      // finished - not based on composer.status, which turned out to be unreliable for this.
+      //
+      // CONFIRMED via real data on 2026-09-01: composer.status stops being "in_progress" well
+      // before a long multi-phase agent turn is actually done - a real "generate the KT_Guide in
+      // pdf form" request kept appending tool-call/thinking bubbles for over 3 minutes (38 headers
+      // total) while status was already non-"in_progress", so gating on composer.status alone
+      // (an earlier version of this fix) still captured early, locking in just the first bit of
+      // narration. The reliable signal turns out to be per-bubble: Cursor stamps `turnDurationMs`
+      // onto a header's `grouping` field ONLY on the bubble it considers the true end of that
+      // reply (confirmed on both a 3.7s "Hello" and this real 186815ms/~3.1min KT_Guide turn) -
+      // every other bubble in the run, however long the run is, lacks it. Requiring the LAST
+      // assistant header in this turn's run to carry that marker means a run that's still growing
+      // (more bubbles yet to come, marker not there yet) is never mistaken for done, regardless of
+      // how long a quiet gap in the middle looks. `aborted` is the one status that's proven
+      // reliable (verified against several real canceled-before-replying turns) and never gets a
+      // turnDurationMs marker, since nothing more is ever coming - so it's still handled as its
+      // own path. Either way, a stability check across 2 consecutive polls still guards the
+      // separate race where the marker/status appears before the bubble's own text has finished
+      // being written.
+      //
+      // CONFIRMED via real data on 2026-09-01 that `aborted` is NOT always terminal either: a
+      // real turn's status flipped to "aborted" while 21 MORE tool-call bubbles were still added
+      // over the following minute (60 headers total, none ever getting a turnDurationMs marker).
+      // The capture that slipped through happened because stability was checked against `response`
+      // alone - and a run of pure tool-call bubbles (empty text: reading files, running shell
+      // commands) leaves the concatenated response text completely unchanged for many polls in a
+      // row even while the bubble count keeps climbing, so it looked "stable" while very much still
+      // running. Folding the assistant bubble COUNT into the tracked value closes this - any new
+      // bubble at all, empty or not, breaks stability and restarts the 2-poll wait, so a run that's
+      // still actively growing can never be mistaken for finished merely because nothing new is
+      // visible yet.
+      const lastAssistantHeader = assistantHeaders[assistantHeaders.length - 1];
+      const hasFinalMarker = lastAssistantHeader?.grouping?.turnDurationMs !== undefined;
+      const isAborted = composer.status === "aborted";
+      const settleValue = `${assistantHeaders.length}:${response}`;
       let ready: boolean;
       if (hasBlockingPendingAction) {
         ready = false;
-      } else if (!hasResponse && isSettled) {
-        ready = true;
-        this.settleTracker.clear(turnKey);
-      } else if (hasResponse) {
-        ready = this.settleTracker.isStable(turnKey, response);
+      } else if (hasFinalMarker || isAborted) {
+        ready = this.settleTracker.isStable(turnKey, settleValue);
       } else {
         ready = false;
       }
+
+      // Nothing above ever declares a turn ready without a genuine completion signal from
+      // Cursor - which means a turn that never gets one (a crashed/stuck agent run, or any other
+      // reason it just never resolves) would otherwise wait forever and silently never reach the
+      // backend at all. Give up after MAX_WAIT_MS since the turn was first seen and send whatever
+      // exists at that point instead - clearly tagged via settleReason so it's not mistaken for a
+      // normal completion - rather than losing it entirely.
+      let gaveUp = false;
+      if (!ready) {
+        const firstSeen = this.pendingSince.get(turnKey);
+        if (firstSeen === undefined) {
+          this.pendingSince.set(turnKey, Date.now());
+        } else if (Date.now() - firstSeen > MAX_WAIT_MS) {
+          ready = true;
+          gaveUp = true;
+        }
+      }
       if (!ready) {
         turnIndex++;
+        i = j;
         continue;
       }
 
-      const toolActivity = this.extractToolActivity(userBubble, assistantBubble);
+      const toolActivity = this.extractToolActivity(userBubble, assistantBubbles);
 
       onEvent({
         provider: this.id,
@@ -318,17 +430,21 @@ export class CursorChatProvider implements Provider {
         prompt,
         response,
         hasResponse,
-        settleReason: composer.status ?? "unknown",
+        settleReason: gaveUp ? "gave_up_waiting" : (composer.status ?? "unknown"),
         capturedAt: new Date(userHeader.createdAt),
         url: `cursor://composer/${composer.composerId}`,
         hostname: "cursor.app",
         path: `/composer/${composer.composerId}`,
         pageTitle: "Cursor Chat",
         toolActivity,
+        contextTokensUsed: composer.contextTokensUsed,
+        contextTokenLimit: composer.contextTokenLimit,
       });
 
       this.emittedTurnKeys.add(turnKey);
+      this.pendingSince.delete(turnKey);
       turnIndex++;
+      i = j;
     }
   }
 
@@ -342,10 +458,13 @@ export class CursorChatProvider implements Provider {
     }
   }
 
-  private extractToolActivity(userBubble?: Bubble, assistantBubble?: Bubble): ToolActivitySummary {
-    const toolResults = assistantBubble?.toolResults ?? [];
-    const relevantFiles = assistantBubble?.relevantFiles ?? userBubble?.relevantFiles ?? [];
-    const newlyCreatedFiles = assistantBubble?.newlyCreatedFiles ?? [];
+  private extractToolActivity(userBubble: Bubble | undefined, assistantBubbles: (Bubble | undefined)[]): ToolActivitySummary {
+    // A real agent-mode reply can span several assistant bubbles (thinking, tool calls, final
+    // answer) - aggregate across all of them, not just one, to match how `response` is now built.
+    const toolResults = assistantBubbles.flatMap((b) => b?.toolResults ?? []);
+    const assistantRelevantFiles = assistantBubbles.flatMap((b) => b?.relevantFiles ?? []);
+    const relevantFiles = assistantRelevantFiles.length > 0 ? assistantRelevantFiles : (userBubble?.relevantFiles ?? []);
+    const newlyCreatedFiles = assistantBubbles.flatMap((b) => b?.newlyCreatedFiles ?? []);
 
     return {
       filesReadCount: relevantFiles.length,

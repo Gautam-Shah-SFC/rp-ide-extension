@@ -2,7 +2,7 @@
   "name": "retroper",
   "displayName": "Retroper",
   "description": "AI usage observability & DLP for IDE AI tools (in-editor chat + coding agents)",
-  "version": "1.0.10",
+  "version": "1.0.28",
   "publisher": "retroper",
   "engines": {
     "vscode": "^1.90.0"

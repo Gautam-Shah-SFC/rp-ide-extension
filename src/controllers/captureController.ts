@@ -9,6 +9,7 @@ import { resolveIdentity } from "../services/identityService";
 import { BUFFER_FILE_NAME, UPLOAD_BATCH_SIZE, UPLOAD_INTERVAL_MS } from "../config/constants";
 import { logger } from "../utils/logger";
 import { tryAcquireLock, releaseLock } from "../utils/fileLock";
+import { sharedRetroperDataDir } from "../utils/pathUtils";
 
 export class CaptureController {
   private queueFilePath: string;
@@ -17,7 +18,15 @@ export class CaptureController {
   private uploadTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext) {
-    this.queueFilePath = path.join(context.globalStorageUri.fsPath, BUFFER_FILE_NAME);
+    // CHANGED 2026-09-09, per explicit request: every provider (Cursor, VS Code Chat, Antigravity,
+    // Claude Code, Codex) now appends to and flushes ONE single queue file in the shared,
+    // host-agnostic location - not context.globalStorageUri, which was a separate file per IDE
+    // host - so a future external "endpoint agent" has exactly one well-known path to read/tail,
+    // regardless of which IDE(s) are running. The existing lock in flush() already guarded against
+    // multiple windows of the SAME host racing on this file; pointing every host at the same path
+    // means that same lock now also correctly guards against DIFFERENT hosts (e.g. Cursor and VS
+    // Code open at once) racing on it - no change to the locking logic itself was needed.
+    this.queueFilePath = path.join(sharedRetroperDataDir(), BUFFER_FILE_NAME);
     this.uploadLockPath = `${this.queueFilePath}.upload.lock`;
   }
 
