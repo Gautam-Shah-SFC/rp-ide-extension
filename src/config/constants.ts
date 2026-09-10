@@ -23,6 +23,11 @@ export const SOURCE_TYPE = "IDE_Extension";
 export const EXTENSION_NAME = "retroper";
 
 export const BUFFER_FILE_NAME = "retroper-queue.jsonl";
+/** Append-only mirror of every captured record. Unlike the queue file, lines here are NEVER
+ * removed after a successful upload - it's the durable local record for an external "endpoint
+ * agent" to read and forward (e.g. to an S3 bucket) on its own schedule. One InteractionRecord
+ * JSON object per line, same shape as the queue file. */
+export const ENDPOINT_FILE_NAME = "retroper-endpoint.jsonl";
 export const UPLOAD_BATCH_SIZE = 25;
 export const UPLOAD_INTERVAL_MS = 30_000;
 export const UPLOAD_MAX_RETRIES = 5;

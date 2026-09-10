@@ -6,13 +6,14 @@ import { normalize } from "../services/normalizerService";
 import * as bufferService from "../services/bufferService";
 import { uploadBatch } from "../services/uploadService";
 import { resolveIdentity } from "../services/identityService";
-import { BUFFER_FILE_NAME, UPLOAD_BATCH_SIZE, UPLOAD_INTERVAL_MS } from "../config/constants";
+import { BUFFER_FILE_NAME, ENDPOINT_FILE_NAME, UPLOAD_BATCH_SIZE, UPLOAD_INTERVAL_MS } from "../config/constants";
 import { logger } from "../utils/logger";
 import { tryAcquireLock, releaseLock } from "../utils/fileLock";
 import { sharedRetroperDataDir } from "../utils/pathUtils";
 
 export class CaptureController {
   private queueFilePath: string;
+  private endpointFilePath: string;
   private uploadLockPath: string;
   private identity: { browserProfileIdentity: BrowserProfileIdentity; appAccountIdentity: AppAccountIdentity } | undefined;
   private uploadTimer: NodeJS.Timeout | undefined;
@@ -28,6 +29,12 @@ export class CaptureController {
     // Code open at once) racing on it - no change to the locking logic itself was needed.
     this.queueFilePath = path.join(sharedRetroperDataDir(), BUFFER_FILE_NAME);
     this.uploadLockPath = `${this.queueFilePath}.upload.lock`;
+    // Durable append-only mirror. The queue file above is drained (lines deleted) as records are
+    // uploaded to the backend, so it is not a reliable record of "everything that was captured".
+    // This file keeps every captured record permanently for an external endpoint agent to read
+    // and forward (e.g. to an S3 bucket) on its own schedule. Retroper only ever appends here -
+    // it never reads, rewrites, or truncates it.
+    this.endpointFilePath = path.join(sharedRetroperDataDir(), ENDPOINT_FILE_NAME);
   }
 
   async initialize(): Promise<void> {
@@ -55,6 +62,7 @@ export class CaptureController {
       this.identity.appAccountIdentity
     );
     bufferService.appendRecords(this.queueFilePath, [record]);
+    bufferService.appendRecords(this.endpointFilePath, [record]);
     logger.info(`Captured turn from ${event.provider} (conversation ${event.conversationId}, turn ${event.turnIndex})`);
   }
 
@@ -97,5 +105,9 @@ export class CaptureController {
 
   queueFile(): string {
     return this.queueFilePath;
+  }
+
+  endpointFile(): string {
+    return this.endpointFilePath;
   }
 }

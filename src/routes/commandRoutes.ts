@@ -38,7 +38,8 @@ export function register(
       const user = authService.getCachedUser();
       const authLine = loggedIn ? `Logged in as ${user?.email ?? "unknown"}.` : "Not logged in.";
       vscode.window.showInformationMessage(
-        `Retroper: ${authLine} ${pending} record(s) queued locally at ${captureController.queueFile()}.`
+        `Retroper: ${authLine} ${pending} record(s) queued for upload at ${captureController.queueFile()}. ` +
+          `Durable endpoint log (never pruned): ${captureController.endpointFile()}.`
       );
     }),
 

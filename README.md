@@ -73,7 +73,8 @@ Files in that folder:
 
 | File | Contents |
 |---|---|
-| `retroper-queue.jsonl` | The outgoing send queue — one JSON `InteractionRecord` per line, appended as turns are captured and removed once successfully uploaded. This is the file to read for "what is Retroper about to send." |
+| `retroper-endpoint.jsonl` | **Durable, append-only.** Every captured record, one JSON `InteractionRecord` per line, retained permanently — lines are never removed. This is the file an external endpoint agent should read and forward (e.g. to an S3 bucket). Retroper only ever appends here. |
+| `retroper-queue.jsonl` | The outgoing send queue for Retroper's own uploader — one record per line, appended as turns are captured and **removed once successfully uploaded** to the backend. Expected to be near-empty on a healthy install; not a reliable record of everything captured (use `retroper-endpoint.jsonl` for that). |
 | `retroper-<provider>-state.json` | Per-provider dedup bookkeeping (which turns have already been seen). Not upload content — internal state only. |
 
 This folder is created automatically the first time Retroper activates in
