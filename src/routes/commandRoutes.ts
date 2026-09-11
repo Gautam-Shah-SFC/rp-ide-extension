@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { CaptureController } from "../controllers/captureController";
 import { CaptureEvent } from "../class/CaptureEvent";
-import * as authService from "../services/authService";
+import * as certIdentityService from "../services/certIdentityService";
 import { logger } from "../utils/logger";
 
 export function register(
@@ -32,14 +32,32 @@ export function register(
       }
     }),
 
+    vscode.commands.registerCommand("retroper.checkCertificate", async () => {
+      const identity = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Retroper: checking device certificate..." },
+        () => certIdentityService.refreshIdentity()
+      );
+      await refreshStatusBar();
+      if (identity.authenticated) {
+        vscode.window.showInformationMessage(
+          `Retroper: ${certIdentityService.describe(identity)} - fingerprint ${identity.fingerprint}, valid until ${identity.validUntil}.`
+        );
+      } else {
+        vscode.window.showWarningMessage(
+          `Retroper: ${certIdentityService.describe(identity)}. Capture continues locally; records are tagged as unauthenticated until the gateway confirms a certificate.`
+        );
+      }
+    }),
+
     vscode.commands.registerCommand("retroper.showStatus", async () => {
       const pending = captureController.queueLength();
-      const loggedIn = await authService.isLoggedIn();
-      const user = authService.getCachedUser();
-      const authLine = loggedIn ? `Logged in as ${user?.email ?? "unknown"}.` : "Not logged in.";
+      const identity = certIdentityService.getCachedIdentity();
+      const certLine = identity.authenticated
+        ? `Device certificate: ${identity.subject ?? identity.fingerprint} (fingerprint ${identity.fingerprint}, valid until ${identity.validUntil}).`
+        : `Device certificate: ${certIdentityService.describe(identity)}.`;
       vscode.window.showInformationMessage(
-        `Retroper: ${authLine} ${pending} record(s) queued for upload at ${captureController.queueFile()}. ` +
-          `Durable endpoint log (never pruned): ${captureController.endpointFile()}.`
+        `Retroper: ${certLine} ${pending} record(s) queued for upload at ${captureController.queueFile()}. ` +
+          `Durable endpoint log (never pruned, read by the endpoint agent): ${captureController.endpointFile()}.`
       );
     }),
 
@@ -70,60 +88,10 @@ export function register(
       try {
         const sent = await captureController.flush();
         logger.info(`retroper.sendTestRecord: flushed ${sent} record(s)`);
-        vscode.window.showInformationMessage(`Retroper: test record sent (${sent} uploaded).`);
+        vscode.window.showInformationMessage(`Retroper: test record written to the endpoint log (${sent} uploaded).`);
       } catch (err) {
         logger.error("retroper.sendTestRecord failed", err);
-        vscode.window.showErrorMessage(`Retroper: test record queued but upload failed - ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }),
-
-    vscode.commands.registerCommand("retroper.login", async () => {
-      const email = await vscode.window.showInputBox({
-        title: "Retroper Login",
-        prompt: "Email",
-        placeHolder: "you@company.com",
-        ignoreFocusOut: true,
-        validateInput: (value) => (value.includes("@") ? undefined : "Enter a valid email address"),
-      });
-      if (!email) return;
-
-      const password = await vscode.window.showInputBox({
-        title: "Retroper Login",
-        prompt: "Password",
-        password: true,
-        ignoreFocusOut: true,
-        validateInput: (value) => (value.length > 0 ? undefined : "Password can't be empty"),
-      });
-      if (!password) return;
-
-      try {
-        const user = await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: "Retroper: logging in..." },
-          () => authService.login(email, password)
-        );
-        await refreshStatusBar();
-        vscode.window.showInformationMessage(`Retroper: logged in as ${user.email}.`);
-      } catch (err) {
-        logger.error("retroper.login failed", err);
-        vscode.window.showErrorMessage(`Retroper: login failed - ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }),
-
-    vscode.commands.registerCommand("retroper.logout", async () => {
-      const choice = await vscode.window.showWarningMessage(
-        "Log out of Retroper? Capture keeps queuing locally but stops uploading until you log in again.",
-        { modal: true },
-        "Log Out"
-      );
-      if (choice !== "Log Out") return;
-
-      try {
-        await authService.logout();
-        await refreshStatusBar();
-        vscode.window.showInformationMessage("Retroper: logged out.");
-      } catch (err) {
-        logger.error("retroper.logout failed", err);
-        vscode.window.showErrorMessage(`Retroper: logout failed - ${err instanceof Error ? err.message : String(err)}`);
+        vscode.window.showErrorMessage(`Retroper: test record written but upload failed - ${err instanceof Error ? err.message : String(err)}`);
       }
     })
   );

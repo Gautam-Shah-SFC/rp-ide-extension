@@ -36,11 +36,16 @@ never sweeps in a machine's pre-existing chat history.
         -> raw turn (poll-based, reads the tool's own local storage)
 [normalizerService]
         -> maps to the InteractionRecord shape, computes sha256 hashes/lengths
+[certIdentityService]
+        -> GET /whoami on the mTLS gateway; stamps the resolved device
+           certificate (fingerprint/serial/subject) onto every record
 [bufferService]
-        -> appends to a shared local JSONL queue (survives restarts / offline)
+        -> appends to a shared local JSONL queue + the durable endpoint log
 [uploadService]
-        -> batches, POSTs { records: [...], source_type: "IDE_Extension" }
-           to the backend ingest endpoint with a Bearer token from authService
+        -> (only if RETROPER_UPLOAD_URL is set) batches, POSTs
+           { records: [...], source_type: "IDE_Extension" } to the ingest
+           endpoint with NO Authorization header - the mTLS gateway
+           authenticates by the device client certificate
 ```
 
 **Shared local queue.** All providers, across every installed IDE host on a
@@ -49,13 +54,42 @@ IDE — see [Local data locations](#local-data-locations) below. This is also
 what prevents an IDE-agnostic tool like Claude Code from being captured and
 uploaded twice if it's used while two different IDEs are both open.
 
-**Authentication.** Run **Retroper: Login** (email/password), which
-authenticates against the backend and stores the returned token in the OS's
-encrypted credential store (Windows Credential Manager, macOS Keychain, or
-equivalent) via VS Code's `SecretStorage` API — never in a plaintext file.
-**Retroper: Logout** clears it. If the token expires, uploads fail once with
-a clear "log in again" message and the extension returns to a logged-out
-state until you do.
+**Authentication.** There is no login, no password, and no token. Identity is
+a per-device client certificate. The extension does a mutual-TLS `GET /whoami`
+against the identity gateway **at most once a day**: the resolved identity is
+persisted to `retroper-cert-identity.json` in the shared data dir and reused
+with no network call until it is ~24h old (so restarting the editor does not
+re-hit the gateway). It stamps the certificate it resolves (`fingerprint`,
+`serial`, `subject`, `issuer`, `authenticated`, `verified_at`) onto every
+captured record as `certificate_identity`, so the endpoint agent tailing
+`retroper-endpoint.jsonl` can attribute each turn to a device and forward it
+to S3. If the gateway reports no certificate, capture still runs and records
+are tagged `authenticated: false` until the next check succeeds. Run
+**Retroper: Check Device Certificate** to force an immediate re-check. Wiring
+real backend ingest auth is a later DP task.
+
+The client certificate is **not bundled in the `.vsix`** — each machine
+supplies its own. The extension looks for it in two places, in order:
+
+1. **Files** in the shared Retroper data dir (or `.env` overrides):
+
+   | File | Purpose |
+   |---|---|
+   | `client.p12` (+ `client.p12.pass`) | PKCS#12 client cert and its password |
+   | `client-cert.pem` + `client-key.pem` | PEM client cert/key (alternative to the `.p12`) |
+   | `ca-chain.pem`, or `root_ca.crt` (+ `intermediate_ca.crt`) | CA chain to verify the gateway |
+
+   Overridable via `.env`: `RETROPER_CLIENT_PFX`, `RETROPER_CLIENT_PFX_PASSWORD`,
+   `RETROPER_CLIENT_CERT`, `RETROPER_CLIENT_KEY`, `RETROPER_CA_BUNDLE`.
+
+2. **The Windows certificate store** (`Cert:\CurrentUser\My`, then
+   `Cert:\LocalMachine\My`) — any cert whose issuer or subject contains
+   `Retroper Development CA` (override with `RETROPER_CERT_STORE_ISSUER`).
+   Because a store-installed private key is usually non-exportable, the
+   `/whoami` call for a store cert goes through Windows' built-in `curl.exe`
+   (Schannel), which uses the key in place. If more than one certificate
+   matches, the extension asks which one to use and remembers the choice in
+   `retroper-cert-selection.json`; with exactly one match it uses that one.
 
 ## Local data locations
 
@@ -74,42 +108,44 @@ Files in that folder:
 | File | Contents |
 |---|---|
 | `retroper-endpoint.jsonl` | **Durable, append-only.** Every captured record, one JSON `InteractionRecord` per line, retained permanently — lines are never removed. This is the file an external endpoint agent should read and forward (e.g. to an S3 bucket). Retroper only ever appends here. |
-| `retroper-queue.jsonl` | The outgoing send queue for Retroper's own uploader — one record per line, appended as turns are captured and **removed once successfully uploaded** to the backend. Expected to be near-empty on a healthy install; not a reliable record of everything captured (use `retroper-endpoint.jsonl` for that). |
+| `retroper-queue.jsonl` | The outgoing send queue for Retroper's own uploader — one record per line, appended as turns are captured and **removed once successfully uploaded**. Only drained when `RETROPER_UPLOAD_URL` is set (direct upload is otherwise off, pending DP); not a reliable record of everything captured (use `retroper-endpoint.jsonl` for that). |
 | `retroper-<provider>-state.json` | Per-provider dedup bookkeeping (which turns have already been seen). Not upload content — internal state only. |
+| `retroper-cert-identity.json` | The last device certificate resolved from `GET /whoami`, reused for ~24h so the gateway isn't re-hit on every editor start. Delete it (or run **Retroper: Check Device Certificate**) to force a fresh check. |
+| `retroper-cert-selection.json` | Which Windows-store certificate the user picked, when more than one matched. Delete it to be asked again. |
+| `client.p12` / `client.p12.pass` / `client-cert.pem` / `client-key.pem` / `ca-chain.pem` (or `root_ca.crt` + `intermediate_ca.crt`) | The device's mTLS client certificate and the CA chain used to verify the gateway. **Provisioned per machine — not shipped in the `.vsix`.** |
 
 This folder is created automatically the first time Retroper activates in
 any IDE; it is not created by the installer.
 
 ## Commands
 
-- **Retroper: Login** — authenticates against the backend and stores the token securely.
-- **Retroper: Logout** — clears the stored token.
-- **Retroper: Send Test Record** — builds a synthetic turn, queues it, and uploads it immediately. Use this to verify an install end-to-end.
-- **Retroper: Flush Queued Records Now** — uploads whatever is currently queued.
-- **Retroper: Show Capture Status** — shows login state, how many records are queued locally, and where the queue file lives.
-- **Retroper: Open Audit Log** — opens a plaintext log of every capture, login, and upload event (with timestamps), for diagnosing "why isn't this showing up" without digging through VS Code's per-window Output panel.
+- **Retroper: Check Device Certificate** — re-runs `GET /whoami` against the mTLS gateway and reports the certificate it resolved (or why it couldn't).
+- **Retroper: Send Test Record** — builds a synthetic turn and writes it to the endpoint log (and uploads it if `RETROPER_UPLOAD_URL` is set). Use this to verify an install end-to-end.
+- **Retroper: Flush Queued Records Now** — uploads whatever is currently queued (no-op unless `RETROPER_UPLOAD_URL` is set).
+- **Retroper: Show Capture Status** — shows the resolved device certificate, how many records are queued locally, and where the queue / endpoint files live.
+- **Retroper: Open Audit Log** — opens a plaintext log of every capture, certificate check, and upload event (with timestamps), for diagnosing "why isn't this showing up" without digging through VS Code's per-window Output panel.
 
-A status bar item (bottom right) always shows current login state; click it
-to log in or out.
+A status bar item (bottom right) always shows the current device-certificate
+state; click it to re-check.
 
 ## Configuration
 
-Non-secret configuration lives in `.env`:
+Non-secret configuration lives in `.env` (all optional):
 
 | Variable | Purpose |
 |---|---|
-| `RETROPER_UPLOAD_URL` | Backend ingest endpoint |
-| `RETROPER_LOGIN_URL` | Optional override; defaults to `<RETROPER_UPLOAD_URL's origin>/api/v1/auth/login` |
+| `RETROPER_UPLOAD_URL` | Direct backend ingest endpoint. **Leave empty** unless DP has provisioned direct upload — with no value, capture still writes `retroper-endpoint.jsonl` for the endpoint agent. When set, uploads carry no `Authorization` header. |
+| `RETROPER_IDENTITY_URL` | Override for the mTLS gateway `/whoami` endpoint. Defaults to `https://ns546939.ip-139-99-120.net:8443/whoami`. |
 
-`.env` is gitignored. It carries no credentials — authentication is handled
-entirely by the login flow above, and the resulting token lives only in the
-OS's encrypted credential store, scoped per machine.
+`.env` is gitignored and carries no credentials. The device client
+certificate is presented to the gateway outside this extension and is never
+stored here.
 
 ## Development setup
 
 ```bash
 npm install
-cp .env.example .env      # fill in RETROPER_UPLOAD_URL
+cp .env.example .env      # optional - defaults work for local capture + endpoint log
 ```
 
 Open this folder in VS Code (or any supported fork) and press **F5** to
@@ -121,8 +157,8 @@ launch an Extension Development Host with Retroper active.
 src/
   class/        interfaces & data shapes (InteractionRecord, CaptureEvent, Provider)
   config/       constants.ts (.env-driven), providers.ts (provider registry)
-  services/     one file per capture adapter, plus normalize/buffer/upload/hash/identity
-  controllers/  extensionController (activate/deactivate), captureController (event -> buffer -> upload)
+  services/     one file per capture adapter, plus normalize/buffer/upload/hash/identity/certIdentity
+  controllers/  extensionController (activate/deactivate), captureController (event -> buffer -> endpoint log + queue)
   routes/       commandRoutes (VS Code commands), eventRoutes (wires adapters -> captureController)
   utils/        id/path/text/logger/retry/file-lock helpers
   extension.ts  entry point

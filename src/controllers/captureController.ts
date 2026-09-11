@@ -6,6 +6,7 @@ import { normalize } from "../services/normalizerService";
 import * as bufferService from "../services/bufferService";
 import { uploadBatch } from "../services/uploadService";
 import { resolveIdentity } from "../services/identityService";
+import { certificateIdentityForRecord } from "../services/certIdentityService";
 import { BUFFER_FILE_NAME, ENDPOINT_FILE_NAME, UPLOAD_BATCH_SIZE, UPLOAD_INTERVAL_MS } from "../config/constants";
 import { logger } from "../utils/logger";
 import { tryAcquireLock, releaseLock } from "../utils/fileLock";
@@ -59,7 +60,8 @@ export class CaptureController {
       event,
       this.context.extension.packageJSON.version,
       this.identity.browserProfileIdentity,
-      this.identity.appAccountIdentity
+      this.identity.appAccountIdentity,
+      certificateIdentityForRecord()
     );
     bufferService.appendRecords(this.queueFilePath, [record]);
     bufferService.appendRecords(this.endpointFilePath, [record]);

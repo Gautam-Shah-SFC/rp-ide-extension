@@ -8,7 +8,7 @@ import { VscodeChatProvider } from "../services/vscodeChatService";
 import { ClaudeCodeProvider } from "../services/claudeCodeService";
 import { CodexProvider } from "../services/codexService";
 import { AntigravityProvider } from "../services/antigravityService";
-import * as authService from "../services/authService";
+import * as certIdentityService from "../services/certIdentityService";
 import * as commandRoutes from "../routes/commandRoutes";
 import * as eventRoutes from "../routes/eventRoutes";
 import { logger, initializeAuditLog } from "../utils/logger";
@@ -28,11 +28,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   initializeAuditLog(auditLogPath);
   logger.info(`=== Retroper activating (version ${context.extension.packageJSON.version}) ===`);
 
-  authService.initialize(context);
-
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   context.subscriptions.push(statusBarItem);
   await refreshStatusBar();
+
+  // When the device's certificate store holds more than one Retroper client certificate, let the
+  // user pick which one to present to the gateway (the choice is remembered).
+  certIdentityService.setCertChooser(async (candidates) => {
+    const pick = await vscode.window.showQuickPick(
+      candidates.map((c) => ({
+        label: c.subject || c.thumbprint,
+        description: `${c.storeLocation}\\My · expires ${c.notAfter}`,
+        detail: `${c.issuer}  ·  ${c.thumbprint}`,
+        thumbprint: c.thumbprint,
+      })),
+      { title: "Retroper: choose the device certificate", placeHolder: "Multiple matching certificates found - pick one", ignoreFocusOut: true }
+    );
+    return pick?.thumbprint;
+  });
+
+  // Resolve this device's identity from the mTLS gateway (GET /whoami) once, then reuse it for ~a
+  // day (persisted to disk). The result is stamped onto every captured record. Not awaited:
+  // activation must not block on a network round-trip, and capture runs regardless of the outcome.
+  certIdentityService
+    .start()
+    .then((identity) => {
+      logger.info(`Retroper: device certificate check - ${certIdentityService.describe(identity)}`);
+      void refreshStatusBar();
+      if (!identity.authenticated) {
+        vscode.window
+          .showInformationMessage(
+            `Retroper: ${certIdentityService.describe(identity)}. Capture runs locally regardless; records are tagged with the device certificate once the gateway confirms one.`,
+            "Check Again"
+          )
+          .then((choice) => {
+            if (choice === "Check Again") {
+              vscode.commands.executeCommand("retroper.checkCertificate");
+            }
+          });
+      }
+    })
+    .catch((err) => logger.error("Retroper: device certificate check threw", err));
 
   captureController = new CaptureController(context);
   await captureController.initialize();
@@ -62,18 +98,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await eventRoutes.wireProviders(providers, captureController);
 
   logger.info(`Retroper activated - audit log at ${auditLogPath}`);
-
-  if (!(await authService.isLoggedIn())) {
-    vscode.window.showInformationMessage("Retroper: log in to start uploading captured AI usage.", "Log In").then((choice) => {
-      if (choice === "Log In") {
-        vscode.commands.executeCommand("retroper.login");
-      }
-    });
-  }
 }
 
 export async function deactivate(): Promise<void> {
   logger.info("=== Retroper deactivating ===");
+  certIdentityService.stop();
   await eventRoutes.stopProviders(providers);
   captureController?.dispose();
   logger.info("Retroper deactivated");
@@ -81,17 +110,15 @@ export async function deactivate(): Promise<void> {
 
 async function refreshStatusBar(): Promise<void> {
   if (!statusBarItem) return;
-  const loggedIn = await authService.isLoggedIn();
+  const identity = certIdentityService.getCachedIdentity();
 
-  if (loggedIn) {
-    const user = authService.getCachedUser();
-    statusBarItem.text = `$(account) Retroper: ${user?.email ?? "Logged in"}`;
-    statusBarItem.tooltip = "Click to log out of Retroper";
-    statusBarItem.command = "retroper.logout";
+  if (identity.authenticated) {
+    statusBarItem.text = `$(shield) Retroper: ${identity.subject ?? identity.fingerprint ?? "certificate verified"}`;
+    statusBarItem.tooltip = `Device certificate verified by the gateway (fingerprint ${identity.fingerprint}, valid until ${identity.validUntil}). Click to re-check.`;
   } else {
-    statusBarItem.text = "$(account) Retroper: Not logged in";
-    statusBarItem.tooltip = "Click to log in to Retroper";
-    statusBarItem.command = "retroper.login";
+    statusBarItem.text = "$(shield) Retroper: no device certificate";
+    statusBarItem.tooltip = `${certIdentityService.describe(identity)}. Click to re-check.`;
   }
+  statusBarItem.command = "retroper.checkCertificate";
   statusBarItem.show();
 }

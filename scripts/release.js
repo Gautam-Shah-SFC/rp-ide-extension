@@ -33,19 +33,20 @@ function run(cmd, args) {
 }
 
 function verifyEnv() {
+  // .env is optional now: with no RETROPER_UPLOAD_URL the extension still captures locally and
+  // writes retroper-endpoint.jsonl for the endpoint agent, and identity comes from the mTLS
+  // gateway (RETROPER_IDENTITY_URL, which has a built-in default). Bundle it if it exists; if it
+  // doesn't, just note that and carry on.
   if (!fs.existsSync(ENV_PATH)) {
-    console.error(`ERROR: ${ENV_PATH} does not exist.`);
-    console.error("Create it with at least RETROPER_UPLOAD_URL before releasing - see .env.example.");
-    process.exit(1);
+    console.log("No .env present - building with built-in defaults (local capture + endpoint log only, gateway identity URL default).");
+    return;
   }
   const envContent = fs.readFileSync(ENV_PATH, "utf8");
   const uploadUrlMatch = envContent.match(/^RETROPER_UPLOAD_URL=(.+)$/m);
   if (!uploadUrlMatch || !uploadUrlMatch[1].trim()) {
-    console.error("ERROR: RETROPER_UPLOAD_URL is missing or empty in .env.");
-    console.error("Refusing to build a release that would silently fail to upload for everyone who installs it.");
-    process.exit(1);
+    console.log("Note: RETROPER_UPLOAD_URL is empty - direct upload stays off; records are written to retroper-endpoint.jsonl for the endpoint agent.");
   }
-  console.log(`.env OK - this exact file will be bundled into the .vsix:`);
+  console.log(`.env found - this exact file will be bundled into the .vsix:`);
   console.log(
     envContent
       .trim()

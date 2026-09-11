@@ -2,7 +2,6 @@ import { InteractionRecord, UploadPayload } from "../class/InteractionRecord";
 import { UPLOAD_URL, UPLOAD_MAX_RETRIES, UPLOAD_RETRY_BASE_DELAY_MS, SOURCE_TYPE } from "../config/constants";
 import { NonRetryableError } from "../utils/retry";
 import { logger } from "../utils/logger";
-import * as authService from "./authService";
 
 export interface UploadResult {
   /** Record ids the backend confirmed it received - safe to remove from the local queue. */
@@ -20,23 +19,29 @@ interface PostOutcome {
   elapsedMs: number;
 }
 
+let warnedNoUrl = false;
+
 export async function uploadBatch(records: InteractionRecord[]): Promise<UploadResult> {
   if (records.length === 0) {
     return { uploadedIds: [], permanentlyRejectedIds: [] };
   }
 
   if (!UPLOAD_URL) {
-    logger.warn("uploadService: RETROPER_UPLOAD_URL not set (see .env.example). Records stay queued locally until configured.");
-    throw new NonRetryableError("Retroper upload not configured: missing RETROPER_UPLOAD_URL in .env");
+    // Direct backend upload is deferred to DP (real ingest auth lives at the mTLS gateway, not
+    // here). Until RETROPER_UPLOAD_URL is configured, records still land durably in
+    // retroper-endpoint.jsonl for the endpoint agent to forward - so this is a quiet no-op, not
+    // an error.
+    if (!warnedNoUrl) {
+      logger.info("uploadService: RETROPER_UPLOAD_URL not set - skipping direct upload; records remain in retroper-endpoint.jsonl for the endpoint agent.");
+      warnedNoUrl = true;
+    }
+    return { uploadedIds: [], permanentlyRejectedIds: [] };
   }
 
-  const token = await authService.getToken();
-  if (!token) {
-    logger.warn("uploadService: not logged in. Records stay queued locally - run 'Retroper: Login'.");
-    throw new NonRetryableError("Retroper: not logged in. Run 'Retroper: Login' to start uploading.");
-  }
-
-  return uploadIsolating(records, token);
+  // No Authorization header: the mTLS gateway authenticates every request by the device client
+  // certificate presented in front of this process, exactly as the browser extension relies on
+  // Chrome's TLS stack.
+  return uploadIsolating(records);
 }
 
 /**
@@ -48,8 +53,8 @@ export async function uploadBatch(records: InteractionRecord[]): Promise<UploadR
  * the batch still gets delivered and only the genuinely-bad record(s) get dropped (with a clear
  * log line explaining why). Verified against a real backend rejection on 2026-08-25.
  */
-async function uploadIsolating(records: InteractionRecord[], token: string): Promise<UploadResult> {
-  const outcome = await postWithRetry(records, token);
+async function uploadIsolating(records: InteractionRecord[]): Promise<UploadResult> {
+  const outcome = await postWithRetry(records);
 
   if (outcome.ok) {
     const sizeKb = Math.round(JSON.stringify(buildPayload(records)).length / 1024);
@@ -57,12 +62,12 @@ async function uploadIsolating(records: InteractionRecord[], token: string): Pro
     return { uploadedIds: records.map((r) => r.id), permanentlyRejectedIds: [] };
   }
 
-  if (outcome.status === 401) {
-    // Token expired/invalid - clear it so we stop retrying with a known-bad token and the
-    // status bar reflects "not logged in" (rather than silently failing every 30s forever).
-    await authService.clearStoredToken();
+  if (outcome.status === 401 || outcome.status === 403) {
+    // The mTLS gateway rejected the request - the device client certificate presented in front
+    // of this process is missing, expired, or not accepted. Retrying can't fix that; leave the
+    // batch queued (and durably in retroper-endpoint.jsonl regardless) and surface it.
     throw new NonRetryableError(
-      `Retroper: session expired, please log in again. Upload failed: 401 Unauthorized (${outcome.elapsedMs}ms) ${outcome.bodyText}`
+      `Retroper: ingest gateway rejected the upload (${outcome.status}). The device client certificate is presented by the OS/gateway, not this extension - check it is installed and valid. (${outcome.elapsedMs}ms) ${outcome.bodyText}`
     );
   }
 
@@ -78,8 +83,8 @@ async function uploadIsolating(records: InteractionRecord[], token: string): Pro
     `uploadService: batch of ${records.length} record(s) rejected (${outcome.status} ${outcome.statusText}) - splitting to isolate which one(s) are at fault. ${outcome.bodyText}`
   );
   const mid = Math.floor(records.length / 2);
-  const left = await uploadIsolating(records.slice(0, mid), token);
-  const right = await uploadIsolating(records.slice(mid), token);
+  const left = await uploadIsolating(records.slice(0, mid));
+  const right = await uploadIsolating(records.slice(mid));
   return {
     uploadedIds: [...left.uploadedIds, ...right.uploadedIds],
     permanentlyRejectedIds: [...left.permanentlyRejectedIds, ...right.permanentlyRejectedIds],
@@ -102,10 +107,10 @@ function buildPayload(records: InteractionRecord[]): UploadPayload {
  * see InteractionRecord.id). This is believed to be the real explanation for records observed
  * reaching the backend as exact-duplicate JSON multiple times, logged explicitly below so future
  * occurrences are directly traceable instead of requiring a guess. */
-async function postWithRetry(records: InteractionRecord[], token: string): Promise<PostOutcome> {
+async function postWithRetry(records: InteractionRecord[]): Promise<PostOutcome> {
   let attempt = 0;
   for (;;) {
-    const outcome = await postOnce(records, token);
+    const outcome = await postOnce(records);
     const isRetryableStatus = outcome.status === 0 || outcome.status >= 500 || outcome.status === 429;
     if (outcome.ok || !isRetryableStatus) {
       return outcome;
@@ -124,7 +129,7 @@ async function postWithRetry(records: InteractionRecord[], token: string): Promi
   }
 }
 
-async function postOnce(records: InteractionRecord[], token: string): Promise<PostOutcome> {
+async function postOnce(records: InteractionRecord[]): Promise<PostOutcome> {
   const bodyText = JSON.stringify(buildPayload(records));
   const sizeKb = Math.round(bodyText.length / 1024);
   const startedAt = Date.now();
@@ -135,7 +140,6 @@ async function postOnce(records: InteractionRecord[], token: string): Promise<Po
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
       },
       body: bodyText,
     });

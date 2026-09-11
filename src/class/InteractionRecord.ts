@@ -17,6 +17,20 @@ export interface ContentStorage {
   boundary: string;
 }
 
+/** The device client certificate the mTLS gateway resolved via GET /whoami, flattened onto
+ * every record so an endpoint agent tailing retroper-endpoint.jsonl can attribute each captured
+ * turn to a specific device cert (and forward it to S3) without a separate lookup. `authenticated`
+ * false / null fields mean the gateway had not confirmed a certificate when this turn was
+ * captured. */
+export interface CertificateIdentity {
+  fingerprint: string | null;
+  serial: string | null;
+  subject: string | null;
+  issuer: string | null;
+  authenticated: boolean;
+  verified_at: string | null;
+}
+
 export interface CaptureDetails {
   settle_reason: string;
   has_response: boolean;
@@ -57,6 +71,7 @@ export interface InteractionRecord {
   text_length: number;
   content_storage: ContentStorage;
   app_account_identity: AppAccountIdentity;
+  certificate_identity: CertificateIdentity;
   capture_method: string;
   capture_details: CaptureDetails;
   poc_notice_visible: boolean;

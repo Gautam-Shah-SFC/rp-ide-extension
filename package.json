@@ -2,7 +2,7 @@
   "name": "retroper",
   "displayName": "Retroper",
   "description": "AI usage observability & DLP for IDE AI tools (in-editor chat + coding agents)",
-  "version": "1.0.29",
+  "version": "1.0.35",
   "publisher": "retroper",
   "engines": {
     "vscode": "^1.90.0"
@@ -29,12 +29,8 @@
         "title": "Retroper: Send Test Record"
       },
       {
-        "command": "retroper.login",
-        "title": "Retroper: Login"
-      },
-      {
-        "command": "retroper.logout",
-        "title": "Retroper: Logout"
+        "command": "retroper.checkCertificate",
+        "title": "Retroper: Check Device Certificate"
       },
       {
         "command": "retroper.openAuditLog",
